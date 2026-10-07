@@ -1,0 +1,16 @@
+.DS_Store
+.cproject
+.project
+.settings
+*.o
+*.d
+*.elf
+*.bin
+*.map
+Bootloader.zip
+Bootloader.sublime-workspace
+.gdbinit
+.vscode
+build
+tmp
+Makefile.user

@@ -1,0 +1,972 @@
+/*
+ * STM32F4 board support for the bootloader.
+ *
+ */
+
+#include "hw_config.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/gpio.h>
+#include "spi_flash.h"
+#include "dbg_uart.h"
+
+/* P4: route UF2 to ext SPI flash */
+#define EXT_GAME_DIR_ADDR   0x020000
+#define EXT_GAME_START_ADDR 0x030000
+int g_write_to_ext = 0;
+int g_upload_failed = 0;
+static uint32_t g_ext_base = EXT_GAME_START_ADDR;
+static uint32_t g_ext_hi = 0;
+void ext_upload_begin(void){
+    g_write_to_ext=1; g_ext_hi=0;
+    { extern char g_uploaded_name[13]; g_uploaded_name[0]=0; }
+    /* scan directory to find next free offset after last game */
+    {
+        uint8_t raw[64];
+        g_ext_base = EXT_GAME_START_ADDR;
+        for (int i=0;i<32;i++){
+            spi_flash_read(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+            if (raw[40]==1){
+                uint32_t off = ((uint32_t)raw[36]<<24)|((uint32_t)raw[37]<<16)|((uint32_t)raw[38]<<8)|raw[39];
+                uint32_t sz = ((uint32_t)raw[32]<<24)|((uint32_t)raw[33]<<16)|((uint32_t)raw[34]<<8)|raw[35];
+                uint32_t end = off + sz;
+                end = (end + 0xFFF) & ~0xFFF; /* align to 4KB */
+                if (end > g_ext_base) g_ext_base = end;
+            }
+        }
+    }
+    dbg_puts("ext upload begin, base="); dbg_hex(g_ext_base); dbg_puts("\n");
+}
+void ext_erase_size(uint32_t size){
+    uint32_t sectors = (size + 4095) / 4096;
+    /* check for same-name overwrite */
+    { extern char g_uploaded_name[13];
+      if (g_uploaded_name[0]) {
+          uint8_t raw[64];
+          for (int i=0;i<32;i++){
+              spi_flash_read(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+              if (raw[40]==1 && !memcmp(raw, g_uploaded_name, 11)){
+                  /* reuse this slot's offset */
+                  g_ext_base = ((uint32_t)raw[36]<<24)|((uint32_t)raw[37]<<16)|((uint32_t)raw[38]<<8)|raw[39];
+                  dbg_puts("overwrite slot "); dbg_hex(i); dbg_puts("\n");
+                  break;
+              }
+          }
+      }
+    }
+    /* check remaining space */
+    uint32_t avail = 0x1e0000 - (g_ext_base - 0x030000);
+    if (size > avail) {
+        dbg_puts("NOT ENOUGH SPACE\n");
+        g_upload_failed = 1;
+        return;
+    }
+    dbg_puts("ext erase "); dbg_hex(sectors); dbg_puts(" secs\n");
+    for(uint32_t s=0; s<sectors; s++){
+        spi_flash_erase_sector(g_ext_base + s*4096);
+    }
+}
+#include <libopencm3/stm32/flash.h>
+#include <libopencm3/stm32/usart.h>
+#include <libopencm3/cm3/systick.h>
+#include <libopencm3/stm32/pwr.h>
+#include <libopencm3/stm32/timer.h>
+#include <libopencm3/cm3/scb.h>
+
+#include <libopencmsis/core_cm3.h>
+
+#include "bl.h"
+#include "dbg_uart.h"
+#include <string.h>
+
+/* flash parameters that we should not really know */
+static struct {
+	uint32_t	sector_number;
+	uint32_t	size;
+} flash_sectors[] = {
+
+	/* Physical FLASH sector 0 is reserved for bootloader and is not
+	 * the table below.
+	 * N sectors may aslo be reserved for the app fw in which case
+	 * the zero based define BOARD_FIRST_FLASH_SECTOR_TO_ERASE must
+	 * be defined to begin the erase above of the reserved sectors.
+	 * The default value of BOARD_FIRST_FLASH_SECTOR_TO_ERASE is 0
+	 * and begins flash erase operations at phsical sector 1 the 0th entry
+	 * in the table below.
+	 * A value of 1 for BOARD_FIRST_FLASH_SECTOR_TO_ERASE would reserve
+	 * the 0th entry and begin erasing a index 1 the third physical sector
+	 * on the device.
+	 *
+	 * When BOARD_FIRST_FLASH_SECTOR_TO_ERASE is defined APP_RESERVATION_SIZE
+	 * must also be defined to remove that additonal reserved FLASH space
+	 * from the BOARD_FLASH_SIZE. See APP_SIZE_MAX below.
+	 */
+
+	{0x01, 16 * 1024},
+	{0x02, 16 * 1024},
+	{0x03, 16 * 1024},
+	{0x04, 64 * 1024},
+	{0x05, 128 * 1024},
+	{0x06, 128 * 1024},
+	{0x07, 128 * 1024},
+	{0x08, 128 * 1024},
+	{0x09, 128 * 1024},
+	{0x0a, 128 * 1024},
+	{0x0b, 128 * 1024},
+	/* flash sectors only in 2MiB devices */
+	{0x10, 16 * 1024},
+	{0x11, 16 * 1024},
+	{0x12, 16 * 1024},
+	{0x13, 16 * 1024},
+	{0x14, 64 * 1024},
+	{0x15, 128 * 1024},
+	{0x16, 128 * 1024},
+	{0x17, 128 * 1024},
+	{0x18, 128 * 1024},
+	{0x19, 128 * 1024},
+	{0x1a, 128 * 1024},
+	{0x1b, 128 * 1024},
+};
+#define BOOTLOADER_RESERVATION_SIZE	(16 * 1024)
+
+#define OTP_BASE			0x1fff7800
+#define OTP_SIZE			512
+#define UDID_START		        0x1FFF7A10
+
+// address of MCU IDCODE
+#define DBGMCU_IDCODE		0xE0042000
+#define STM32_UNKNOWN	0
+#define STM32F40x_41x	0x413
+#define STM32F42x_43x	0x419
+#define STM32F42x_446xx	0x421
+
+#define REVID_MASK	0xFFFF0000
+#define DEVID_MASK	0xFFF
+
+#ifndef BOARD_PIN_VBUS
+# define BOARD_PIN_VBUS                 GPIO9
+# define BOARD_PORT_VBUS                GPIOA
+# define BOARD_CLOCK_VBUS               RCC_AHB1ENR_IOPAEN
+#endif
+
+/* magic numbers from reference manual */
+
+typedef enum mcu_rev_e {
+	MCU_REV_STM32F4_REV_A = 0x1000,
+	MCU_REV_STM32F4_REV_Z = 0x1001,
+	MCU_REV_STM32F4_REV_Y = 0x1003,
+	MCU_REV_STM32F4_REV_1 = 0x1007,
+	MCU_REV_STM32F4_REV_3 = 0x2001
+} mcu_rev_e;
+
+typedef struct mcu_des_t {
+	uint16_t mcuid;
+	const char *desc;
+	char  rev;
+} mcu_des_t;
+
+// The default CPU ID  of STM32_UNKNOWN is 0 and is in offset 0
+// Before a rev is known it is set to ?
+// There for new silicon will result in STM32F4..,?
+mcu_des_t mcu_descriptions[] = {
+	{ STM32_UNKNOWN,	"STM32F???",    '?'},
+	{ STM32F40x_41x, 	"STM32F40x",	'?'},
+	{ STM32F42x_43x, 	"STM32F42x",	'?'},
+	{ STM32F42x_446xx, 	"STM32F446XX",	'?'},
+};
+
+char serial_number[32];
+#define STM32_UUID ((uint32_t *)UDID_START)
+
+static void initSerialNumber()
+{
+	writeHex(serial_number, STM32_UUID[0]);
+	writeHex(serial_number+8, STM32_UUID[1]);
+	writeHex(serial_number+16, STM32_UUID[2]);
+}
+
+
+typedef struct mcu_rev_t {
+	mcu_rev_e revid;
+	char  rev;
+} mcu_rev_t;
+
+/* context passed to cinit */
+#if INTERFACE_USB
+# define BOARD_INTERFACE_CONFIG_USB  	NULL
+#endif
+
+/* board definition */
+struct boardinfo board_info = {
+	.board_rev	= 0,
+
+#ifdef STM32F401
+	.systick_mhz	= 84,
+#else
+	.systick_mhz	= 168,
+#endif
+};
+
+static void board_init(void);
+
+#define BOOT_RTC_SIGNATURE          0x71a21877
+#define APP_RTC_SIGNATURE           0x24a22d12
+#define POWER_DOWN_RTC_SIGNATURE    0x5019684f // Written by app fw to not re-power on.
+#define HF2_RTC_SIGNATURE           0x39a63a78
+#define SLEEP_RTC_ARG               0x10b37889
+#define SLEEP2_RTC_ARG              0x7e3353b7
+
+#define BOOT_RTC_REG                MMIO32(RTC_BASE + 0x50)
+#define ARG_RTC_REG                MMIO32(RTC_BASE + 0x54)
+
+/* standard clocking for all F4 boards */
+static struct rcc_clock_scale clock_setup = {
+	.pllm = 0,
+	.plln = 336,
+#if defined(STM32F401)
+	.pllp = 4,
+	.pllq = 7,
+	.pllr = 0,
+	.hpre = RCC_CFGR_HPRE_DIV_NONE,
+	.ppre1 = RCC_CFGR_PPRE_DIV_2,
+	.ppre2 = RCC_CFGR_PPRE_DIV_NONE,
+#if defined(BL_F412)
+	.flash_config = FLASH_ACR_ICE | FLASH_ACR_DCE | FLASH_ACR_LATENCY_3WS,
+#else
+	.flash_config = FLASH_ACR_ICE | FLASH_ACR_DCE | FLASH_ACR_LATENCY_2WS,
+#endif
+	.ahb_frequency  = 84000000,
+#else
+	.pllp = 2,
+	.pllq = 7,
+#if defined(STM32F446) || defined(STM32F469)
+	.pllr = 2,
+#endif
+	.hpre = RCC_CFGR_HPRE_DIV_NONE,
+	.ppre1 = RCC_CFGR_PPRE_DIV_4,
+	.ppre2 = RCC_CFGR_PPRE_DIV_2,
+	.flash_config = FLASH_ACR_ICE | FLASH_ACR_DCE | FLASH_ACR_LATENCY_5WS,
+#endif
+	.power_save = 0,
+	.apb1_frequency = 42000000,
+	.apb2_frequency = 84000000,
+};
+
+static uint32_t
+board_get_rtc_signature(uint32_t *arg)
+{
+	/* enable the backup registers */
+	PWR_CR |= PWR_CR_DBP;
+	RCC_BDCR |= RCC_BDCR_RTCEN;
+
+	uint32_t result = BOOT_RTC_REG;
+	if (arg)
+		*arg = ARG_RTC_REG;
+
+	/* disable the backup registers */
+	RCC_BDCR &= RCC_BDCR_RTCEN;
+	PWR_CR &= ~PWR_CR_DBP;
+
+	return result;
+}
+
+void
+board_set_rtc_signature(uint32_t sig, uint32_t arg)
+{
+	/* enable the backup registers */
+	PWR_CR |= PWR_CR_DBP;
+	RCC_BDCR |= RCC_BDCR_RTCEN;
+
+	BOOT_RTC_REG = sig;
+	ARG_RTC_REG = arg;
+
+	/* disable the backup registers */
+	RCC_BDCR &= RCC_BDCR_RTCEN;
+	PWR_CR &= ~PWR_CR_DBP;
+}
+
+static bool
+board_test_force_pin()
+{
+#if defined(BOARD_FORCE_BL_PIN_IN) && defined(BOARD_FORCE_BL_PIN_OUT)
+	/* two pins strapped together */
+	volatile unsigned samples = 0;
+	volatile unsigned vote = 0;
+	
+	for (volatile unsigned cycles = 0; cycles < 10; cycles++) {
+		gpio_set(BOARD_FORCE_BL_PORT, BOARD_FORCE_BL_PIN_OUT);
+
+		for (unsigned count = 0; count < 20; count++) {
+			if (gpio_get(BOARD_FORCE_BL_PORT, BOARD_FORCE_BL_PIN_IN) != 0) {
+				vote++;
+			}
+
+			samples++;
+		}
+
+		gpio_clear(BOARD_FORCE_BL_PORT, BOARD_FORCE_BL_PIN_OUT);
+
+		for (unsigned count = 0; count < 20; count++) {
+			if (gpio_get(BOARD_FORCE_BL_PORT, BOARD_FORCE_BL_PIN_IN) == 0) {
+				vote++;
+			}
+
+			samples++;
+		}
+	}
+
+	/* the idea here is to reject wire-to-wire coupling, so require > 90% agreement */
+	if ((vote * 100) > (samples * 90)) {
+		return true;
+	}
+
+#endif
+#if defined(BOARD_FORCE_BL_PIN)
+	/* single pin pulled up or down */
+	volatile unsigned samples = 0;
+	volatile unsigned vote = 0;
+
+	for (samples = 0; samples < 200; samples++) {
+		if ((gpio_get(BOARD_FORCE_BL_PORT, BOARD_FORCE_BL_PIN) ? 1 : 0) == BOARD_FORCE_BL_STATE) {
+			vote++;
+		}
+	}
+
+	/* reject a little noise */
+	if ((vote * 100) > (samples * 90)) {
+		return true;
+	}
+
+#endif
+	return false;
+}
+
+
+static void
+board_init(void)
+{
+	RCC_APB1ENR |= RCC_APB1ENR_PWREN;
+	RCC_APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+	// enable all GPIO clocks
+	RCC_AHB1ENR |= RCC_AHB1ENR_IOPAEN|RCC_AHB1ENR_IOPBEN|RCC_AHB1ENR_IOPCEN|
+		RCC_AHB1ENR_IOPCEN|RCC_AHB1ENR_IOPDEN|RCC_AHB1ENR_IOPEEN|
+		RCC_AHB1ENR_IOPFEN|RCC_AHB1ENR_IOPGEN|RCC_AHB1ENR_IOPHEN|
+		RCC_AHB1ENR_IOPIEN|RCC_AHB1ENR_IOPJEN|RCC_AHB1ENR_IOPKEN|
+		BOARD_CLOCK_VBUS;
+
+	// make sure JACDAC line is up, otherwise trashes the bus
+	setup_input_pin(CFG_PIN_JACK_TX);
+
+	setup_output_pin(CFG_PIN_LED);
+	setup_output_pin(CFG_PIN_LED1);
+
+	setup_input_pin(CFG_PIN_USB_POWER);
+
+#if defined(BOARD_FORCE_BL_PIN)
+	/* configure the force BL pins */
+
+	gpio_mode_setup(BOARD_FORCE_BL_PORT, GPIO_MODE_INPUT,
+		BOARD_FORCE_BL_STATE ? GPIO_PUPD_PULLDOWN : GPIO_PUPD_PULLUP,
+		BOARD_FORCE_BL_PIN);
+#endif
+
+	initSerialNumber();
+}
+
+void
+board_deinit(void)
+{
+	/* disable the power controller clock */
+	rcc_peripheral_disable_clock(&RCC_APB1ENR, RCC_APB1ENR_PWREN);
+
+	/* disable the AHB peripheral clocks */
+	RCC_AHB1ENR = 0x00100000; // XXX Magic reset number from STM32F4x reference manual
+}
+
+/**
+  * @brief  Initializes the RCC clock configuration.
+  *
+  * @param  clock_setup : The clock configuration to set
+  */
+static inline void
+clock_init(void)
+{
+	uint32_t pllm = BOOT_SETTINGS->hseValue / 1000000;
+	if (pllm < 4 || pllm > 60 || pllm * 1000000 != BOOT_SETTINGS->hseValue)
+		pllm = OSC_FREQ;
+	clock_setup.pllm = pllm;
+	rcc_clock_setup_hse_3v3(&clock_setup);
+}
+
+/**
+  * @brief  Resets the RCC clock configuration to the default reset state.
+  * @note   The default reset state of the clock configuration is given below:
+  *            - HSI ON and used as system clock source
+  *            - HSE, PLL and PLLI2S OFF
+  *            - AHB, APB1 and APB2 prescaler set to 1.
+  *            - CSS, MCO1 and MCO2 OFF
+  *            - All interrupts disabled
+  * @note   This function doesn't modify the configuration of the
+  *            - Peripheral clocks
+  *            - LSI, LSE and RTC clocks
+  */
+void
+clock_deinit(void)
+{
+	/* Enable internal high-speed oscillator. */
+	rcc_osc_on(RCC_HSI);
+	rcc_wait_for_osc_ready(RCC_HSI);
+
+	/* Reset the RCC_CFGR register */
+	RCC_CFGR = 0x000000;
+
+	/* Stop the HSE, CSS, PLL, PLLI2S, PLLSAI */
+	rcc_osc_off(RCC_HSE);
+	rcc_osc_off(RCC_PLL);
+	rcc_css_disable();
+
+	/* Reset the RCC_PLLCFGR register */
+	RCC_PLLCFGR = 0x24003010; // XXX Magic reset number from STM32F4xx reference manual
+
+	/* Reset the HSEBYP bit */
+	rcc_osc_bypass_disable(RCC_HSE);
+
+	/* Reset the CIR register */
+	RCC_CIR = 0x000000;
+}
+
+uint32_t
+flash_func_sector_size(unsigned sector)
+{
+	if (sector < BOARD_FLASH_SECTORS) {
+		return flash_sectors[sector].size;
+	}
+
+	return 0;
+}
+
+static uint8_t erasedSectors[BOARD_FLASH_SECTORS];
+
+static bool is_blank(uint32_t addr, uint32_t size) {
+		for (unsigned i = 0; i < size; i += sizeof(uint32_t)) {
+			if (*(uint32_t*)(addr + i) != 0xffffffff) {
+				DMESG("non blank: %p i=%d/%d", addr, i, size);
+				return false;
+			}
+		}
+		return true;
+}
+
+void
+flash_write(uint32_t dst, const uint8_t *src, int len)
+{
+	if (g_write_to_ext) {
+		uint32_t off = dst - APP_LOAD_ADDRESS;
+		uint32_t ext = g_ext_base + off;
+		spi_flash_write(ext, src, len);
+		if(off+len>g_ext_hi) g_ext_hi=off+len;
+		return;
+	}
+	// assume sector 0 (bootloader) is same size as sector 1
+	uint32_t addr = flash_func_sector_size(0) + (APP_LOAD_ADDRESS & 0xfff00000);
+	uint32_t sector = 0;
+	int erased = false;
+	uint32_t size = 0;
+
+	for (unsigned i = 0; i < BOARD_FLASH_SECTORS; i++) {
+		size = flash_func_sector_size(i);
+		if (addr + size > dst) {
+			sector = flash_sectors[i].sector_number;
+			erased = erasedSectors[i];
+			erasedSectors[i] = 1; // don't erase anymore - we will continue writing here!
+			break;
+		}
+		addr += size;
+	}
+
+	if (sector == 0) 
+		PANIC("invalid sector");
+
+
+	flash_unlock();
+	if (dst == APP_LOAD_ADDRESS) {
+		extern void dbg_puts(const char*); extern void dbg_hex(uint32_t);
+		dbg_puts("fw: dst="); dbg_hex(dst);
+		dbg_puts(" sec="); dbg_hex(sector);
+		dbg_puts(" addr="); dbg_hex(addr);
+		dbg_puts(" sz="); dbg_hex(size);
+		dbg_puts(" erased="); dbg_hex(erased); dbg_puts("\n");
+	}
+	if (!erased && !is_blank(addr, size)) {
+		if (dst == APP_LOAD_ADDRESS) dbg_puts("fw: erasing...\n");
+		flash_erase_sector(sector, FLASH_CR_PROGRAM_X32);
+		if (!is_blank(addr, size)) { dbg_puts("erase fail\n"); PANIC("erase"); }
+	}
+	for (int i = 0; i < len; i += 4) {
+		flash_program_word(dst + i, *(uint32_t*)(src + i));
+	}
+	if (memcmp((void*)dst, src, len) != 0) { dbg_puts("write mismatch\n"); PANIC("write"); }
+}
+
+void
+flash_func_erase_sector(unsigned sector)
+{
+	if (sector >= BOARD_FLASH_SECTORS || sector < BOARD_FIRST_FLASH_SECTOR_TO_ERASE) {
+		return;
+	}
+
+	/* Caculate the logical base address of the sector
+	 * flash_func_read_word will add APP_LOAD_ADDRESS
+	 */
+	uint32_t address = 0;
+
+	for (unsigned i = BOARD_FIRST_FLASH_SECTOR_TO_ERASE; i < sector; i++) {
+		address += flash_func_sector_size(i);
+	}
+
+	/* blank-check the sector */
+	unsigned size = flash_func_sector_size(sector);
+	bool blank = true;
+
+	for (unsigned i = 0; i < size; i += sizeof(uint32_t)) {
+		if (flash_func_read_word(address + i) != 0xffffffff) {
+			blank = false;
+			break;
+		}
+	}
+
+	/* erase the sector if it failed the blank check */
+	if (!blank) {
+		flash_erase_sector(flash_sectors[sector].sector_number, FLASH_CR_PROGRAM_X32);
+	}
+}
+
+void
+flash_func_write_word(uint32_t address, uint32_t word)
+{
+	flash_program_word(address + APP_LOAD_ADDRESS, word);
+}
+
+uint32_t
+flash_func_read_word(uint32_t address)
+{
+	if (address & 3) {
+		return 0;
+	}
+
+	return *(uint32_t *)(address + APP_LOAD_ADDRESS);
+}
+
+uint32_t
+flash_func_read_otp(uint32_t address)
+{
+	if (address & 3) {
+		return 0;
+	}
+
+	if (address > OTP_SIZE) {
+		return 0;
+	}
+
+	return *(uint32_t *)(address + OTP_BASE);
+}
+
+uint32_t
+flash_func_read_sn(uint32_t address)
+{
+	// read a byte out from unique chip ID area
+	// it's 12 bytes, or 3 words.
+	return *(uint32_t *)(address + UDID_START);
+}
+
+void
+led_on(unsigned led)
+{
+	switch (led) {
+	case LED_ACTIVITY:
+		pin_set(CFG_PIN_LED, 1);
+		break;
+
+	case LED_BOOTLOADER:
+		pin_set(CFG_PIN_LED1, 1);
+		break;
+	}
+}
+
+void
+led_off(unsigned led)
+{
+	switch (led) {
+	case LED_ACTIVITY:
+		pin_set(CFG_PIN_LED, 0);
+		break;
+
+	case LED_BOOTLOADER:
+		pin_set(CFG_PIN_LED1, 0);
+		break;
+	}
+}
+
+/* we should know this, but we don't */
+#ifndef SCB_CPACR
+# define SCB_CPACR (*((volatile uint32_t *) (((0xE000E000UL) + 0x0D00UL) + 0x088)))
+#endif
+
+void flash_bootloader(void);
+int hf2_mode = 0;
+
+void warning_screen(uint32_t);
+
+#define PWR_CR_LPLVDS (1 << 10)
+void deepsleep() {
+
+	setup_output_pin(CFG_PIN_JACK_BZEN);
+	setup_output_pin(CFG_PIN_JACK_HPEN);
+	setup_output_pin(CFG_PIN_JACK_PWREN);
+	setup_output_pin(CFG_PIN_JACK_SND);
+	setup_output_pin(CFG_PIN_SPEAKER_AMP);
+
+	// this is needed for the BOOT0 circuit
+	setup_output_pin(CFG_PIN_BTN_MENU2);
+
+	setup_input_pin(CFG_PIN_BTN_A);
+	setup_input_pin(CFG_PIN_BTN_B);
+	setup_input_pin(CFG_PIN_BTN_LEFT);
+	setup_input_pin(CFG_PIN_BTN_RIGHT);
+	setup_input_pin(CFG_PIN_BTN_UP);
+	setup_input_pin(CFG_PIN_BTN_DOWN);
+
+  screen_sleep();
+
+	setup_input_pin(CFG_PIN_BTN_MENU);
+
+#if 0
+	RCC_AHB1LPENR = 0x1900F;
+  RCC_AHB2LPENR = 0x0;
+  RCC_APB1LPENR = 0x10000000;
+  RCC_APB2LPENR = 0x00004000;
+#endif
+
+	__disable_irq();
+	
+	for (;;) {
+		enable_exti(CFG_PIN_BTN_MENU);
+	
+		PWR_CR |= PWR_CR_FPDS | PWR_CR_LPDS | PWR_CR_LPLVDS;
+		SCB->SCR |= SCB_SCR_SLEEPDEEP;
+		asm("wfe");
+	
+		clock_init();
+	
+		int d = 0;
+		for (;;d += 50) {
+			screen_delay(50);
+			if (pin_get(CFG_PIN_BTN_MENU) == 1)
+				break;
+			if (d > 1000)
+				pin_set(CFG_PIN_DISPLAY_BL, 1);
+		}
+		if (d > 1000) {
+			resetIntoApp();
+		}
+	}
+}
+
+int
+main(void)
+{
+	bool try_boot = false;
+	unsigned timeout = BOOTLOADER_DELAY;	/* if nonzero, drop out of the bootloader after this time */
+
+	/* Enable the FPU before we hit any FP instructions */
+	SCB_CPACR |= ((3UL << 10 * 2) | (3UL << 11 * 2)); /* set CP10 Full Access and set CP11 Full Access */
+
+#if defined(BOARD_POWER_PIN_OUT)
+
+	/* Here we check for the app setting the POWER_DOWN_RTC_SIGNATURE
+	 * in this case, we reset the signature and wait to die
+	 */
+	if (board_get_rtc_signature(0) == POWER_DOWN_RTC_SIGNATURE) {
+		board_set_rtc_signature(0, 0);
+
+		while (1);
+	}
+
+#endif
+
+	/* do board-specific initialisation */
+	board_init();
+
+	/* configure the clock for bootloader activity */
+	clock_init();
+
+	#ifdef BL_FLASHER
+	
+	flash_bootloader();
+
+	#else
+
+#ifdef APP_ON_POR
+	if (RCC_CSR & RCC_CSR_PORRSTF) {
+		try_boot = true;
+	}
+#endif
+
+	RCC_CSR |= RCC_CSR_RMVF; // clear reset reason
+
+	uint32_t bootArg = 0;
+	uint32_t bootSig = board_get_rtc_signature(&bootArg);
+
+	if (hasScreen() && lookupCfg(CFG_BOOTLOADER_PROTECTION, 0) && (FLASH_OPTCR & 0x80030000)) {
+		warning_screen(bootSig);
+	}
+
+	DMESG("bootsig: %p", bootSig);
+
+
+	if (bootSig == APP_RTC_SIGNATURE && bootArg == SLEEP_RTC_ARG) {
+		// next time show instructions
+		board_set_rtc_signature(APP_RTC_SIGNATURE, SLEEP2_RTC_ARG);
+		deepsleep();
+	}
+
+	if (bootSig == APP_RTC_SIGNATURE && bootArg == SLEEP2_RTC_ARG) {
+		screen_init();
+		draw_hold_menu();
+		setup_input_pin(CFG_PIN_BTN_MENU);
+		for (int i = 0; i < 200; ++i) {
+			screen_delay(10);
+			// if they touch MENU while the instruction screen is on,
+			// just stop the sleep and boot into app
+			if (pin_get(CFG_PIN_BTN_MENU) == 0) {
+				bootArg = 0;
+				break;
+			}
+		}
+		if (bootArg)
+			deepsleep();
+	}
+
+	/*
+	* Clear the signature so that if someone resets us while we're
+	* in the bootloader we'll try to boot next time.
+	* But save post-upload flag first.
+	*/
+	uint32_t postUploadFlag = (bootSig == 0xDEADBEEF) ? 1 : 0;
+	if (bootSig)
+		board_set_rtc_signature(0, 0);
+
+	//bootSig = HF2_RTC_SIGNATURE;
+
+	if (bootSig == HF2_RTC_SIGNATURE) {
+		try_boot = false;
+		timeout = 2000;
+		hf2_mode = 1;
+	}
+
+	/*
+	 * Check the force-bootloader register; if we find the signature there, don't
+	 * try booting.
+	 */
+	if (bootSig == BOOT_RTC_SIGNATURE) {
+
+		/*
+		 * Don't even try to boot before dropping to the bootloader.
+		 */
+		try_boot = false;
+
+		/*
+		 * Don't drop out of the bootloader until something has been uploaded.
+		 */
+		timeout = 0;
+
+	}
+
+	if (bootSig == APP_RTC_SIGNATURE) {
+		try_boot = true;
+	}
+
+
+	// normally, CFG_PIN_USB_POWER is configured with is_active_high(),
+	// which means results from pin_get() are reversed
+	if (lookupCfg(CFG_PIN_USB_POWER, -1) != -1 && pin_get(CFG_PIN_USB_POWER) != 0) {
+		try_boot = true;
+	}
+
+#ifdef BOARD_SKIP_USB
+	try_boot = true;
+#endif
+
+	/*
+	 * Check if the force-bootloader pins are strapped; if strapped,
+	 * don't try booting.
+	 */
+	if (board_test_force_pin()) {
+		try_boot = false;
+	}
+
+	/*
+	 * Check for USB connection - if present, don't try to boot, but set a timeout after
+	 * which we will fall out of the bootloader.
+	 *
+	 * If the force-bootloader pins are tied, we will stay here until they are removed and
+	 * we then time out.
+	 */
+#if 0
+#if defined(BOARD_USB_VBUS_SENSE_DISABLED)
+	try_boot = false;
+#else
+	if (gpio_get(BOARD_PORT_VBUS, BOARD_PIN_VBUS) != 0) {
+
+		/* don't try booting before we set up the bootloader */
+		try_boot = false;
+	}
+#endif
+#endif
+
+	/* Always go to game menu, unless USB plugged in or BOOT held */
+	try_boot = true;
+	if (board_test_force_pin()) try_boot = false;
+	/* after ext upload, go to menu even with USB */
+	if (gpio_get(GPIOD, GPIO2) && !postUploadFlag) try_boot = false;
+
+	if (try_boot) {
+		game_menu();
+		timeout = 0;
+	}
+
+
+	/* start the interface */
+	/* if MENU held on boot with USB, go to game menu instead */
+	{ extern void game_menu(void);
+	  gpio_mode_setup(GPIOC, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, GPIO1);
+	  for(int d=0;d<100000;d++) __asm__("nop");
+	  if (gpio_get(GPIOC, GPIO1) == 0) {
+	      game_menu();
+	      timeout = 0;
+	  }
+	}
+
+	cinit(BOARD_INTERFACE_CONFIG_USB, USB);
+
+
+	while (1) {
+		DMESG("enter bootloader, tmo=%d", timeout);
+
+		// if they hit reset the second time, go to app
+		board_set_rtc_signature(APP_RTC_SIGNATURE, 0);
+		
+		/* run the bootloader, come back after an app is uploaded or we time out */
+		bootloader(timeout);
+
+		/* if the force-bootloader pins are strapped, just loop back */
+		if (board_test_force_pin()) {
+			continue;
+		}
+
+		if (g_write_to_ext) {
+			dbg_puts("commit dir hi="); dbg_hex(g_ext_hi); dbg_puts("\n");
+			uint8_t raw[64];
+			for (int i=0;i<32;i++){
+				spi_flash_read(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+				dbg_puts("slot "); dbg_hex(i); dbg_puts(" st="); dbg_hex(raw[40]); dbg_puts("\n");
+				if (raw[40]==0||raw[40]==0xFF){
+					memset(raw,0,64);
+					memcpy(raw,"Game",4);
+					raw[32]=(g_ext_hi>>24)&0xff; raw[33]=(g_ext_hi>>16)&0xff;
+					raw[34]=(g_ext_hi>>8)&0xff; raw[35]=g_ext_hi&0xff;
+					raw[36]=(g_ext_base>>24)&0xff; raw[37]=(g_ext_base>>16)&0xff;
+					raw[38]=(g_ext_base>>8)&0xff; raw[39]=g_ext_base&0xff;
+					raw[40]=1;
+					spi_flash_erase_sector(EXT_GAME_DIR_ADDR);
+					for(int j=0;j<i;j++){ uint8_t o[64]; spi_flash_read(EXT_GAME_DIR_ADDR+j*64,o,64); spi_flash_write(EXT_GAME_DIR_ADDR+j*64,o,64); }
+					spi_flash_write(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+					break;
+				}
+			}
+			g_write_to_ext=0;
+			board_set_rtc_signature(0,0);
+			scb_reset_system();
+		}
+		board_set_rtc_signature(0, 0);
+
+		/* look to see if we can boot the app */
+		jump_to_app();
+
+		/* launching the app failed - stay in the bootloader forever */
+		timeout = 0;
+	}
+
+	#endif
+}
+
+void flushFlash(void);
+
+/* P4: write directory entry after UF2 ext-flash upload, then reset to menu */
+void commit_ext_dir_and_reset(void) {
+	uint8_t dir[32][64];
+	dbg_puts("commit dir hi="); dbg_hex(g_ext_hi); dbg_puts("\n");
+	/* read all slots first (before erase!) */
+	int slot=-1;
+	for (int i=0;i<32;i++){
+		spi_flash_read(EXT_GAME_DIR_ADDR+i*64, dir[i], 64);
+		dbg_puts("slot "); dbg_hex(i); dbg_puts(" st="); dbg_hex(dir[i][40]); dbg_puts("\n");
+		if (slot<0 && (dir[i][40]==0||dir[i][40]==0xFF)) slot=i;
+	}
+	if (slot>=0){
+		memset(dir[slot],0,64);
+		{ extern char g_uploaded_name[13];
+		memcpy(dir[slot], g_uploaded_name[0] ? g_uploaded_name : "Game", 31); }
+		dir[slot][32]=(g_ext_hi>>24)&0xff; dir[slot][33]=(g_ext_hi>>16)&0xff;
+		dir[slot][34]=(g_ext_hi>>8)&0xff; dir[slot][35]=g_ext_hi&0xff;
+		dir[slot][36]=(g_ext_base>>24)&0xff; dir[slot][37]=(g_ext_base>>16)&0xff;
+		dir[slot][38]=(g_ext_base>>8)&0xff; dir[slot][39]=g_ext_base&0xff;
+		dir[slot][40]=1;
+		/* now erase and rewrite all */
+		spi_flash_erase_sector(EXT_GAME_DIR_ADDR);
+		for(int i=0;i<32;i++){
+			if(dir[i][40]==1) spi_flash_write(EXT_GAME_DIR_ADDR+i*64, dir[i], 64);
+		}
+		dbg_puts("wrote slot "); dbg_hex(slot); dbg_puts("\n");
+	}
+	g_write_to_ext=0;
+	/* set flag: next boot go to menu even with USB */
+	board_set_rtc_signature(0xDEADBEEF, 0);
+}
+
+void resetIntoApp() {
+	flushFlash();
+	if (g_write_to_ext) {
+		uint8_t raw[64];
+		for (int i=0;i<32;i++){
+			spi_flash_read(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+			if (raw[40]==0 || raw[40]==0xFF) {
+				memset(raw,0,64);
+				memcpy(raw,"Game",4);
+				raw[32]=(g_ext_hi>>24)&0xff; raw[33]=(g_ext_hi>>16)&0xff;
+				raw[34]=(g_ext_hi>>8)&0xff; raw[35]=g_ext_hi&0xff;
+				raw[36]=(g_ext_base>>24)&0xff; raw[37]=(g_ext_base>>16)&0xff;
+				raw[38]=(g_ext_base>>8)&0xff; raw[39]=g_ext_base&0xff;
+				raw[40]=1;
+				spi_flash_erase_sector(EXT_GAME_DIR_ADDR);
+				for(int j=0;j<i;j++){ uint8_t old[64]; spi_flash_read(EXT_GAME_DIR_ADDR+j*64,old,64); spi_flash_write(EXT_GAME_DIR_ADDR+j*64,old,64); }
+				spi_flash_write(EXT_GAME_DIR_ADDR+i*64, raw, 64);
+				break;
+			}
+		}
+		g_write_to_ext=0;
+		board_set_rtc_signature(0,0);
+		scb_reset_system();
+	}
+	board_set_rtc_signature(APP_RTC_SIGNATURE, 0);
+	scb_reset_system();
+}
+
+void resetIntoBootloader() {
+	flushFlash();
+	board_set_rtc_signature(BOOT_RTC_SIGNATURE, 0);
+	scb_reset_system();
+}
