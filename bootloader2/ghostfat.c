@@ -205,6 +205,8 @@ void ghostfat_1ms() {
     if (resetTime && ms >= resetTime) {
         flushFlash();
         { extern int g_write_to_ext; if(g_write_to_ext){ extern void commit_ext_dir_and_reset(void); commit_ext_dir_and_reset(); } }
+        { extern int g_flasher_mode; extern void enter_flasher_app(void);
+          if (g_flasher_mode) enter_flasher_app(); }
         scb_reset_system();
         while (1)
             ;
@@ -340,6 +342,14 @@ static void write_block_core(uint32_t block_no, const uint8_t *data, bool quiet,
 
     if (!is_uf2_block(bl) || !UF2_IS_MY_FAMILY(bl)) {
         return;
+    }
+
+    /* P4-self-update: detect flasher.uf2 by custom family, force write to internal app area */
+    { extern int g_flasher_mode; extern int g_write_to_ext;
+      if ((bl->flags & UF2_FLAG_FAMILYID_PRESENT) && bl->familyID == UF2_FLASHER_FAMILY) {
+          g_flasher_mode = 1;
+          g_write_to_ext = 0;
+      }
     }
 
     /* detect file size from first block, erase ext flash before writing */

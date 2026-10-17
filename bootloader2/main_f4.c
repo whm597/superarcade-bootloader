@@ -17,6 +17,7 @@
 #define EXT_GAME_START_ADDR 0x030000
 int g_write_to_ext = 0;
 int g_upload_failed = 0;
+int g_flasher_mode = 0;   /* set when a flasher.uf2 (family 0x5a5a0001) is being uploaded */
 static uint32_t g_ext_base = EXT_GAME_START_ADDR;
 static uint32_t g_ext_hi = 0;
 void ext_upload_begin(void){
@@ -215,6 +216,12 @@ static void board_init(void);
 #define APP_RTC_SIGNATURE           0x24a22d12
 #define POWER_DOWN_RTC_SIGNATURE    0x5019684f // Written by app fw to not re-power on.
 #define HF2_RTC_SIGNATURE           0x39a63a78
+
+/* P4-self-update: flasher.uf2 upload finished - make reset jump to flasher app at 0x08010000 */
+void enter_flasher_app(void) {
+    g_flasher_mode = 0;
+    board_set_rtc_signature(APP_RTC_SIGNATURE, 0);
+}
 #define SLEEP_RTC_ARG               0x10b37889
 #define SLEEP2_RTC_ARG              0x7e3353b7
 

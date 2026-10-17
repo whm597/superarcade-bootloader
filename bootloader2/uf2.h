@@ -41,8 +41,12 @@ DEALINGS IN THE SOFTWARE.
 #define UF2_FLAG_NOFLASH 0x00000001
 #define UF2_FLAG_FAMILYID_PRESENT 0x00002000
 
+/* P4-self-update: custom family for flasher.uf2 (32KB bootloader board) */
+#define UF2_FLASHER_FAMILY 0x5a5a0001
+
 #define UF2_IS_MY_FAMILY(bl)                                                                       \
-    (((bl)->flags & UF2_FLAG_FAMILYID_PRESENT) == 0 || (bl)->familyID == UF2_FAMILY)
+    (((bl)->flags & UF2_FLAG_FAMILYID_PRESENT) == 0 || (bl)->familyID == UF2_FAMILY || \
+     (bl)->familyID == UF2_FLASHER_FAMILY)
 
 
 #define MAX_BLOCKS (BOARD_FLASH_SIZE / 256 + 100)
