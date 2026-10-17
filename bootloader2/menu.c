@@ -311,8 +311,11 @@ void game_menu(void) {
     PWR_CR |= PWR_CR_DBP;
     RCC_BDCR |= RCC_BDCR_RTCEN;
     uint32_t last_slot = RTC_BKP0;
+    uint32_t upflag = MMIO32(RTC_BASE + 0x58);
+    if (upflag == 0xF001) MMIO32(RTC_BASE + 0x58) = 0;   /* consume notice */
     RCC_BDCR &= ~RCC_BDCR_RTCEN;
     PWR_CR &= ~PWR_CR_DBP;
+    const char *init_status = (upflag == 0xF001) ? "外部空间不足" : NULL;
 
     for (;;) {
         int n = fl ? list_games(games, MAX_GAMES) : 0;
@@ -321,7 +324,7 @@ void game_menu(void) {
         if (last_slot >= n) last_slot = 0;
         int total = n + has_continue;
         int sel = 0;
-        draw_menu(games, n, sel, NULL, has_continue, fl);
+        draw_menu(games, n, sel, init_status, has_continue, fl);
 
         for (;;) {
             int k = wait_key();

@@ -907,6 +907,17 @@ void flushFlash(void);
 
 /* P4: write directory entry after UF2 ext-flash upload, then reset to menu */
 void commit_ext_dir_and_reset(void) {
+	/* space-low: skip writing a bad (size=0) dir entry, signal menu to show notice */
+	if (g_upload_failed) {
+		g_upload_failed = 0;
+		g_write_to_ext = 0;
+		/* flag in RTC_BKP2 = 0xF001 (space low) */
+		PWR_CR |= PWR_CR_DBP; RCC_BDCR |= RCC_BDCR_RTCEN;
+		MMIO32(RTC_BASE + 0x58) = 0xF001;
+		RCC_BDCR &= ~RCC_BDCR_RTCEN; PWR_CR &= ~PWR_CR_DBP;
+		board_set_rtc_signature(0xDEADBEEF, 0);
+		return;
+	}
 	uint8_t dir[32][64];
 	dbg_puts("commit dir hi="); dbg_hex(g_ext_hi); dbg_puts("\n");
 	/* read all slots first (before erase!) */
